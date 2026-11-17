@@ -1,0 +1,876 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pseudo-Depth</title>
+<style>
+  :root {
+    --paper: #f6f5f1;
+    --ink: #1c1c1e;
+    --dim: #8e8b85;
+    --rule: #d5d1c9;
+  }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--paper); color: var(--ink);
+    font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    letter-spacing: .04em;
+  }
+  #drop { outline: 1px dashed #9a968e; outline-offset: -12px; }
+  select { font: inherit; color: var(--ink); background: var(--paper); border: 1px solid var(--rule); }
+
+  #ui {
+    position: fixed; top: 12px; left: 16px; right: 16px; z-index: 2;
+    display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  }
+  button {
+    background: var(--paper); color: var(--ink);
+    border: 1px solid var(--rule); border-radius: 2px;
+    padding: 6px 10px; font: inherit; letter-spacing: inherit; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: #9a968e; }
+  button:disabled { opacity: .4; cursor: default; }
+  .amount { display: flex; align-items: center; gap: 8px; margin-left: 10px; color: var(--dim); }
+  .amount output { width: 3ch; text-align: right; color: var(--ink); }
+  input[type=range] { width: 150px; accent-color: #444; }
+  input[type=range].small { width: 80px; }
+  .amount + .amount { margin-left: 4px; }
+
+  .seg { display: flex; margin-left: 10px; }
+  .seg button { border-radius: 0; margin-left: -1px; color: var(--dim); }
+  .seg button:first-child { border-radius: 2px 0 0 2px; margin-left: 0; }
+  .seg button:last-child { border-radius: 0 2px 2px 0; }
+  .seg button.on { color: var(--ink); border-color: #9a968e; position: relative; z-index: 1; }
+
+  .debug { margin-left: auto; display: flex; gap: 10px; color: var(--dim); opacity: .7; }
+  .debug label { display: flex; gap: 4px; align-items: center; cursor: pointer; user-select: none; }
+  input[type=checkbox] { accent-color: #555; margin: 0; }
+
+  #stage {
+    position: fixed; left: 16px; right: 16px; top: 56px; bottom: 34px;
+    display: grid; place-items: center;
+  }
+  #art { display: block; }
+
+  #status { position: fixed; left: 16px; bottom: 12px; color: var(--dim); z-index: 2; }
+
+  #thumbs {
+    position: fixed; right: 16px; bottom: 12px; z-index: 2;
+    display: flex; gap: 8px; align-items: flex-end;
+  }
+  #thumbs figure { margin: 0; display: none; width: 180px; }
+  #thumbs figure.on { display: block; }
+  #thumbs canvas { width: 180px; display: block; border: 1px solid var(--rule); background: #fff; }
+  #thumbs figcaption { color: var(--dim); margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+</style>
+</head>
+<body>
+
+
+<div id="ui">
+  <button id="upload">Upload Image</button>
+  <input type="file" id="file" accept="image/*" hidden>
+  <button id="clear" disabled>Clear</button>
+  <button id="save" disabled>Save PNG</button>
+  <div class="amount">
+    Explosion Amount
+    <input type="range" id="amount" min="0" max="100" value="100" disabled>
+    <output id="amountOut">100</output>
+  </div>
+  <div class="amount" title="number of depth bands (re-cut without re-estimating depth)">
+    Layers <input type="range" class="small" id="bands" min="2" max="12" value="8"><output id="bandsOut">8</output>
+  </div>
+  <div class="amount" title="opacity of the photographic layers">
+    Image <input type="range" class="small" id="imgOp" min="0" max="100" value="100"><output id="imgOpOut">100</output>
+  </div>
+  <div class="amount" title="opacity of the traces (outlines, echoes, smears, leader lines)">
+    Trace <input type="range" class="small" id="trOp" min="0" max="100" value="100"><output id="trOpOut">100</output>
+  </div>
+  <div id="dirs" class="seg" title="which way the layers come apart">
+    <button data-dir="forward" class="on">Forward</button>
+    <button data-dir="sideways">Sideways</button>
+  </div>
+  <div id="styles" class="seg" title="keys 1–3">
+    <button data-style="lines">Lines</button>
+    <button data-style="extrude" class="on">Extrude</button>
+    <button data-style="shards">Shards</button>
+  </div>
+  <div class="debug">
+    <label title="model = machine-estimated depth · brightness = blurred luminance used as fake depth">depth
+      <select id="src"><option value="model">model</option><option value="brightness">brightness</option></select></label>
+    <label><input type="checkbox" id="dbgDepth"> depth</label>
+    <label><input type="checkbox" id="dbgMasks"> masks</label>
+  </div>
+</div>
+
+<div id="stage"><canvas id="art"></canvas></div>
+
+<div id="status">Upload an image, drop one here, or paste one.</div>
+
+<div id="thumbs">
+  <figure id="fDepth"><figcaption>estimated depth (white = near)</figcaption><canvas id="tDepth"></canvas></figure>
+  <figure id="fMasks"><figcaption>depth bands 1 (near) → 8 (far)</figcaption><canvas id="tMasks"></canvas></figure>
+</div>
+
+<script type="module">
+/* ---------------------------------------------------------------------------
+   Pseudo-Depth
+   flat frame → machine-estimated depth → 8 depth bands → 8 image layers
+   → layers displaced by depth → their movement leaves traces → drawing
+
+   Styles (how the movement is drawn; the layers always come from depth only):
+     lines   – thin boundary outlines left behind every few px
+     extrude – solid, ribbed copies of each layer along an arc
+     shards  – straight cuts break each depth layer into fragments that fly outward
+--------------------------------------------------------------------------- */
+
+const TF_URL   = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6/dist/transformers.min.js';
+const MODEL_ID = 'onnx-community/depth-anything-v2-small';
+
+const CFG = {
+  bands: 8,             // depth bands / image layers
+  quantile: true,       // thresholds so each band holds ~the same number of pixels
+  blurPasses: 1,        // light smoothing of the depth map (keeps machine error)
+  maxShift: 620,        // sideways: displacement of the nearest layer at 100 (art px)
+  zoom: 0.7,            // forward: the nearest layer grows to 1 + zoom times its size
+  zoomMargin: 0.22,     // forward: paper around the image, as a share of its long side
+  farShare: 0.03,       // the farthest layer still moves this fraction of maxShift
+  shiftCurve: 1.3,      // >1: displacement grows faster toward the near layers
+  explodeMs: 3200,      // automatic explosion after an image is loaded
+  minVertices: 6,       // ignore the tiniest boundary specks
+  // per style
+  lines:   { step: 6,  fade: 0.42 },
+  extrude: { step: 5,  fade: 0.0, arc: 0.16 },
+  shards:  { cuts: 15, reach: 380, spin: 0.55, seed: 7 },
+};
+
+/* art space */
+/* art space: sized to the current image and style, so nothing is wasted or cut */
+const A = { W: 1960, H: 1180, IW: 1200, IH: 900, ox: 70, oy: 80 };
+const origin = () => ({ x: A.ox, y: A.oy });
+
+const $ = id => document.getElementById(id);
+const art = $('art'); art.width = A.W; art.height = A.H;
+const actx = art.getContext('2d');
+const slider = $('amount'), amountOut = $('amountOut');
+const setStatus = s => { $('status').textContent = s; };
+
+const cap = document.createElement('canvas'); cap.width = A.IW; cap.height = A.IH;
+const cctx = cap.getContext('2d', { willReadFrequently: true });
+const traces = document.createElement('canvas'); traces.width = A.W; traces.height = A.H;
+const tctx = traces.getContext('2d');
+
+function layoutArt(st) {
+  if (st === 'shards') {
+    const mx = Math.round(CFG.shards.reach * 0.8), my = Math.round(CFG.shards.reach * 0.45);
+    A.W = A.IW + 2 * mx; A.H = A.IH + 2 * my; A.ox = mx; A.oy = my;
+  } else if (direction === 'forward') {
+    const m = Math.round(Math.max(A.IW, A.IH) * CFG.zoomMargin);
+    A.W = A.IW + 2 * m; A.H = A.IH + 2 * m; A.ox = m; A.oy = m;
+  } else {
+    const arc = st === 'extrude' ? Math.ceil(CFG.extrude.arc * CFG.maxShift) : 0;
+    A.ox = 70; A.oy = 80 + arc;
+    A.W = A.ox * 2 + A.IW + CFG.maxShift; A.H = A.oy + A.IH + 50;
+  }
+  if (art.width !== A.W || art.height !== A.H) { art.width = A.W; art.height = A.H; }
+  if (traces.width !== A.W || traces.height !== A.H) { traces.width = A.W; traces.height = A.H; }
+  fitDisplay();
+}
+/* scale the canvas to fit the space between the toolbar and the status line */
+function fitDisplay() {
+  $('stage').style.top = Math.ceil($('ui').getBoundingClientRect().bottom + 12) + 'px';   // toolbar may wrap
+  const r = $('stage').getBoundingClientRect();
+  const k = Math.min(r.width / A.W, r.height / A.H);
+  art.style.width = Math.floor(A.W * k) + 'px';
+  art.style.height = Math.floor(A.H * k) + 'px';
+}
+window.addEventListener('resize', fitDisplay);
+new ResizeObserver(fitDisplay).observe($('stage'));
+new ResizeObserver(fitDisplay).observe($('ui'));
+
+let model = null, Tensor = null, device = '';
+let stage = 'idle';            // idle | estimating | exploded
+let modelPromise = null;       // depth model loads in the background
+let style = 'extrude';
+let direction = 'forward';     // forward: near layers grow toward the viewer · sideways: they slide right
+let depth = null;              // { field, w, h, th, band }
+let layers = [];               // [{ k, canvas, lines, weight, lastA }]
+let shards = [];               // [{ k, canvas, bx, by, cx, cy, dirX, dirY, reach, spin }]
+let layersVersion = 0, shardsVersion = -1;   // shards are cut lazily, only when the Shards style is used
+
+/* Canvas memory: some browsers (Safari) cap the total memory of all canvases and
+   silently turn new canvases blank when it is exceeded. So layer canvases are reused,
+   and canvases that are no longer needed are shrunk to 0×0 right away. */
+const layerPool = [];
+function layerCanvas(k) {
+  const c = layerPool[k] || (layerPool[k] = document.createElement('canvas'));
+  if (c.width !== A.IW || c.height !== A.IH) { c.width = A.IW; c.height = A.IH; }
+  return c;
+}
+const releaseCanvas = c => { if (c) { c.width = 0; c.height = 0; } };
+function releaseShards() { for (const sh of shards) releaseCanvas(sh.canvas); shards = []; shardsVersion = -1; }
+let amount = 0, target = 1, tween = null;
+const op = { image: 1, trace: 1 };   // opacity sliders
+
+/* ---- small helpers ------------------------------------------------------------ */
+function mulberry32(a) {
+  return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+const nearness = k => (CFG.bands - 1 - k) / (CFG.bands - 1);         // 1 nearest … 0 farthest
+const weightOf = k => CFG.farShare + (1 - CFG.farShare) * Math.pow(nearness(k), CFG.shiftCurve);
+
+/* sideways offset of a layer for a given explosion amount */
+function offsetOf(L, a = amount) {
+  if (direction === 'forward') return { dx: 0, dy: 0 };
+  const dx = a * CFG.maxShift * L.weight;
+  const dy = style === 'extrude' ? -Math.sin(Math.PI * a) * CFG.extrude.arc * CFG.maxShift * L.weight : 0;
+  return { dx, dy };
+}
+/* where a layer is drawn: top-left corner + scale.
+   forward: scaled about the image centre, nearer = larger, as if coming toward you */
+function placeOf(L, a = amount) {
+  const o = origin();
+  if (direction === 'forward') {
+    const s = 1 + a * CFG.zoom * L.weight;
+    return { x: o.x + A.IW * (1 - s) / 2, y: o.y + A.IH * (1 - s) / 2, s };
+  }
+  const { dx, dy } = offsetOf(L, a);
+  return { x: o.x + dx, y: o.y + dy, s: 1 };
+}
+/* how far (art px) a layer's edge travels over the full explosion */
+const travelOf = L => direction === 'forward'
+  ? CFG.zoom * L.weight * Math.hypot(A.IW, A.IH) / 2
+  : CFG.maxShift * L.weight;
+
+/* ---- marching squares → joined polylines (normalized 0..1) ------------------ */
+const CASES = [[], [3, 2], [2, 1], [3, 1], [0, 1], [3, 0, 2, 1], [0, 2], [3, 0],
+               [3, 0], [0, 2], [0, 1, 3, 2], [0, 1], [3, 1], [2, 1], [3, 2], []];
+function isolines(f, w, h, lv) {
+  const out = [];
+  const HE = (w - 1) * h;
+  const edgeA = new Int32Array(HE + w * (h - 1)).fill(-1);
+  const edgeB = new Int32Array(edgeA.length).fill(-1);
+  const segE = [];
+  for (let y = 0; y < h - 1; y++) for (let x = 0; x < w - 1; x++) {
+    const i = y * w + x;
+    const c = (f[i] >= lv) << 3 | (f[i + 1] >= lv) << 2 | (f[i + w + 1] >= lv) << 1 | (f[i + w] >= lv);
+    const segs = CASES[c];
+    if (!segs.length) continue;
+    const ids = [y * (w - 1) + x, HE + y * w + x + 1, (y + 1) * (w - 1) + x, HE + y * w + x];
+    for (let s = 0; s < segs.length; s += 2) {
+      const si = segE.length >> 1, a = ids[segs[s]], b = ids[segs[s + 1]];
+      segE.push(a, b);
+      for (const e of [a, b]) { if (edgeA[e] < 0) edgeA[e] = si; else edgeB[e] = si; }
+    }
+  }
+  const used = new Uint8Array(segE.length >> 1);
+  const other = (e, s) => edgeA[e] === s ? edgeB[e] : edgeA[e];
+  for (let s0 = 0; s0 < used.length; s0++) {
+    if (used[s0]) continue;
+    used[s0] = 1;
+    const fwd = [segE[s0 * 2 + 1]], back = [segE[s0 * 2]];
+    for (const [chain, startE] of [[fwd, segE[s0 * 2 + 1]], [back, segE[s0 * 2]]]) {
+      let e = startE, s = s0;
+      for (;;) {
+        const n = other(e, s);
+        if (n < 0 || used[n]) break;
+        used[n] = 1;
+        e = segE[n * 2] === e ? segE[n * 2 + 1] : segE[n * 2];
+        chain.push(e); s = n;
+      }
+    }
+    const edges = back.reverse().concat(fwd);
+    if (edges.length < CFG.minVertices) continue;
+    const pts = new Float32Array(edges.length * 2);
+    edges.forEach((e, k) => {
+      let x0, y0, x1, y1;
+      if (e < HE) { y0 = y1 = Math.floor(e / (w - 1)); x0 = e % (w - 1); x1 = x0 + 1; }
+      else { const v = e - HE; x0 = x1 = v % w; y0 = Math.floor(v / w); y1 = y0 + 1; }
+      const a = f[y0 * w + x0], b = f[y1 * w + x1];
+      const t = b !== a ? (lv - a) / (b - a) : 0.5;
+      pts[k * 2] = (x0 + (x1 - x0) * t + 0.5) / w;
+      pts[k * 2 + 1] = (y0 + (y1 - y0) * t + 0.5) / h;
+    });
+    out.push(relax(pts));
+  }
+  return out;
+}
+function relax(p) {
+  const n = p.length / 2, q = Float32Array.from(p);
+  for (let i = 1; i < n - 1; i++) {
+    q[i * 2] = p[i * 2] * 0.5 + (p[i * 2 - 2] + p[i * 2 + 2]) * 0.25;
+    q[i * 2 + 1] = p[i * 2 + 1] * 0.5 + (p[i * 2 - 1] + p[i * 2 + 3]) * 0.25;
+  }
+  return q;
+}
+function strokeLines(ctx, lines, x, y, s = 1) {
+  const w = A.IW * s, h = A.IH * s;
+  ctx.beginPath();
+  for (const p of lines) {
+    ctx.moveTo(x + p[0] * w, y + p[1] * h);
+    for (let i = 2; i < p.length; i += 2) ctx.lineTo(x + p[i] * w, y + p[i + 1] * h);
+  }
+  ctx.stroke();
+}
+
+/* ---- depth model (loads in the background) ----------------------------------- */
+function ensureModel() {
+  if (!modelPromise) modelPromise = (async () => {
+    const tf = await import(TF_URL);
+    Tensor = tf.Tensor;
+    tf.env.allowLocalModels = false;
+    await loadModel(tf);
+  })();
+  return modelPromise;
+}
+
+async function loadModel(tf) {
+  const hasGPU = !!navigator.gpu && !!(await navigator.gpu.requestAdapter().catch(() => null));
+  const attempts = hasGPU
+    ? [['webgpu', 'fp16', 504], ['webgpu', 'fp32', 504], ['wasm', 'q8', 392]]
+    : [['wasm', 'q8', 392], ['wasm', 'fp32', 336]];
+  let lastErr;
+  for (const [dev, dtype, L] of attempts) {
+    try {
+      if (stage !== 'estimating') setStatus(`loading depth model (${dev}/${dtype})…`);
+      const m = await tf.AutoModel.from_pretrained(MODEL_ID, {
+        device: dev, dtype,
+        progress_callback: p => {
+          if (p.status === 'progress' && p.total)
+            setStatus(`loading depth model ${Math.round(p.loaded / p.total * 100)}%`);
+        },
+      });
+      const tw = L, th = Math.round(L * 3 / 4 / 14) * 14;
+      const test = await m({ pixel_values: new Tensor('float32', new Float32Array(3 * tw * th), [1, 3, th, tw]) });
+      readDepth(test);
+      model = m; device = dev; inLong = L;
+      if (stage === 'idle') setStatus(`depth model ready (${dev}) — upload an image, drop one here, or paste one`);
+      return;
+    } catch (e) { console.warn('depth model attempt failed', dev, dtype, e); lastErr = e; }
+  }
+  throw lastErr;
+}
+let inLong = 392;
+
+function readDepth(out) {
+  const t = out.predicted_depth ?? Object.values(out)[0];
+  const dims = t.dims, h = dims[dims.length - 2], w = dims[dims.length - 1];
+  let d = t.data;
+  if (d instanceof Uint16Array) d = halfToFloat(d);
+  else if (!(d instanceof Float32Array)) d = Float32Array.from(d);
+  if (d.length !== w * h) throw new Error('unexpected depth shape ' + dims);
+  return { d, w, h };
+}
+function halfToFloat(u16) {
+  const f = new Float32Array(u16.length);
+  for (let i = 0; i < u16.length; i++) {
+    const h = u16[i], s = h & 0x8000 ? -1 : 1, e = (h >> 10) & 31, m = h & 1023;
+    f[i] = e === 0 ? s * m * 2 ** -24 : e === 31 ? (m ? NaN : s * Infinity) : s * (1 + m / 1024) * 2 ** (e - 15);
+  }
+  return f;
+}
+
+/* ---- image in ------------------------------------------------------------------ */
+let hasImage = false;
+async function loadImageFile(file) {
+  if (!file || !file.type.startsWith('image/')) return;
+  let bmp;
+  try { bmp = await createImageBitmap(file); }
+  catch { setStatus('could not read that image'); return; }
+  // fit inside 1200 × 900, keep the image's own proportions
+  const s = Math.min(1200 / bmp.width, 900 / bmp.height);
+  A.IW = Math.round(bmp.width * s); A.IH = Math.round(bmp.height * s);
+  cap.width = A.IW; cap.height = A.IH;
+  cctx.drawImage(bmp, 0, 0, A.IW, A.IH);
+  layoutArt(style);
+  bmp.close?.();
+  hasImage = true;
+  $('clear').disabled = false;
+  process();
+}
+
+/* ---- estimate depth → layers → explode ------------------------------------------ */
+async function process() {
+  if (!hasImage || stage === 'estimating') return;
+  stage = 'estimating';
+  $('upload').disabled = true;
+  await new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
+  try {
+    const src = $('src').value;
+    // model input keeps the image's proportions, sides in multiples of 14
+    const L = src === 'model' ? (await ensureModel(), inLong) : 392;
+    const portrait = A.IH > A.IW;
+    let w = portrait ? Math.round(L * A.IW / A.IH / 14) * 14 : L;
+    let h = portrait ? L : Math.round(L * A.IH / A.IW / 14) * 14;
+    w = Math.max(56, w); h = Math.max(56, h);
+
+    const ic = document.createElement('canvas'); ic.width = w; ic.height = h;
+    const ictx = ic.getContext('2d', { willReadFrequently: true });
+    ictx.drawImage(cap, 0, 0, w, h);
+    const rgba = ictx.getImageData(0, 0, w, h).data, n = w * h;
+    releaseCanvas(ic);
+    const mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
+    const px = new Float32Array(3 * n);
+    for (let i = 0; i < n; i++) for (let c = 0; c < 3; c++)
+      px[i + c * n] = (rgba[i * 4 + c] / 255 - mean[c]) / std[c];
+
+    let d, dw = w, dh = h;
+    if (src === 'model') {
+      setStatus('estimating depth…');
+      const out = await model({ pixel_values: new Tensor('float32', px, [1, 3, h, w]) });
+      ({ d, w: dw, h: dh } = readDepth(out));
+    } else {
+      setStatus('brightness as depth…');
+      d = brightnessDepth(px, w, h);
+    }
+    depth = { w: dw, h: dh, field: normalizeDepth(d, dw, dh) };
+    setStatus(`depth → ${CFG.bands} bands → layers…`);
+    await new Promise(r => setTimeout(r, 0));
+    buildLayers();
+    drawDebug();
+    stage = 'exploded';
+    slider.disabled = false;
+    $('save').disabled = false;
+    if (target < 0.2) { target = 1; }
+    replay();
+  } catch (e) {
+    console.error(e);
+    stage = 'idle';
+    setStatus('depth failed: ' + (e?.message || e) + ' — try depth: brightness');
+  }
+  $('upload').disabled = false;
+}
+
+/* not computer vision: blurred luminance standing in for depth (bright = near).
+   Average of the normalized channels, 9×9 box blur at 392 px. */
+function brightnessDepth(px, w, h) {
+  const n = w * h, lum = new Float32Array(n);
+  for (let i = 0; i < n; i++) lum[i] = (px[i] + px[i + n] + px[i + 2 * n]) / 3;
+  const r = 4, tmp = new Float32Array(n), out = new Float32Array(n);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let s = 0, c = 0;
+    for (let k = Math.max(0, x - r); k <= Math.min(w - 1, x + r); k++) { s += lum[y * w + k]; c++; }
+    tmp[y * w + x] = s / c;
+  }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let s = 0, c = 0;
+    for (let k = Math.max(0, y - r); k <= Math.min(h - 1, y + r); k++) { s += tmp[k * w + x]; c++; }
+    out[y * w + x] = s / c;
+  }
+  return out;
+}
+
+/* start again from the aligned image and open it up */
+function replay() {
+  if (style === 'shards' && shardsVersion !== layersVersion) buildShards();
+  layoutArt(style);
+  tctx.clearRect(0, 0, A.W, A.H);
+  amount = 0;
+  for (const L of layers) L.lastA = null;
+  recordTraces();
+  tween = { t0: performance.now() };
+  setStatus($('src').value === 'model' ? 'exploding by estimated depth…' : 'exploding by brightness (not depth)…');
+}
+
+function normalizeDepth(d, w, h) {
+  const f = Float32Array.from(d), tmp = new Float32Array(f.length);
+  for (let p = 0; p < CFG.blurPasses; p++) {
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      tmp[i] = (f[i - (x > 0)] + f[i] + f[i + (x < w - 1)]) / 3;
+    }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      f[i] = (tmp[i - (y > 0 ? w : 0)] + tmp[i] + tmp[i + (y < h - 1 ? w : 0)]) / 3;
+    }
+  }
+  const s = Float32Array.from(f).sort();
+  const lo = s[Math.floor(s.length * 0.01)], hi = s[Math.floor(s.length * 0.99)];
+  const k = hi - lo > 1e-6 ? 1 / (hi - lo) : 0;
+  for (let i = 0; i < f.length; i++) f[i] = Math.min(1, Math.max(0, (f[i] - lo) * k));
+  return f;
+}
+
+/* thresholds → band per pixel → one transparent RGB layer per band + its boundary */
+function buildLayers() {
+  const { field, w, h } = depth, B = CFG.bands;
+  const th = [];
+  if (CFG.quantile) {
+    const s = Float32Array.from(field).sort();
+    for (let j = 1; j < B; j++) th.push(s[Math.floor(j / B * s.length)]);
+  } else for (let j = 1; j < B; j++) th.push(j / B);
+  depth.th = th;
+  const bandOf = v => { let b = 0; for (const t of th) if (v >= t) b++; return B - 1 - b; };   // 0 = nearest
+  depth.band = Uint8Array.from(field, bandOf);
+
+  const src = cctx.getImageData(0, 0, A.IW, A.IH).data;
+  const datas = Array.from({ length: B }, () => new ImageData(A.IW, A.IH));
+  const sx = w / A.IW, sy = h / A.IH;
+  for (let y = 0; y < A.IH; y++) {
+    const fy = Math.min(h - 1, Math.max(0, (y + 0.5) * sy - 0.5)), y0 = Math.floor(fy), y1 = Math.min(h - 1, y0 + 1), ty = fy - y0;
+    for (let x = 0; x < A.IW; x++) {
+      const fx = Math.min(w - 1, Math.max(0, (x + 0.5) * sx - 0.5)), x0 = Math.floor(fx), x1 = Math.min(w - 1, x0 + 1), tx = fx - x0;
+      const v = (field[y0 * w + x0] * (1 - tx) + field[y0 * w + x1] * tx) * (1 - ty)
+              + (field[y1 * w + x0] * (1 - tx) + field[y1 * w + x1] * tx) * ty;
+      const i = (y * A.IW + x) * 4, dd = datas[bandOf(v)].data;
+      dd[i] = src[i]; dd[i + 1] = src[i + 1]; dd[i + 2] = src[i + 2]; dd[i + 3] = 255;
+    }
+  }
+  const iso = th.map(t => isolines(field, w, h, t));
+  releaseShards();
+  for (let k = B; k < layerPool.length; k++) releaseCanvas(layerPool[k]);
+  layerPool.length = Math.min(layerPool.length, B);
+  layersVersion++;
+  layers = datas.map((data, k) => {
+    const c = layerCanvas(k);
+    c.getContext('2d').putImageData(data, 0, 0);
+    const lines = [];
+    const jUpper = B - 1 - k, jLower = B - 2 - k;
+    if (jUpper < th.length) lines.push(...iso[jUpper]);
+    if (jLower >= 0) lines.push(...iso[jLower]);
+    return { k, canvas: c, lines, weight: weightOf(k), lastA: null };
+  });
+}
+
+/* ---- shards: straight cuts × depth bands ---------------------------------------
+   The cuts are arbitrary straight lines (like scissors); they do not know what is
+   in the image. Each fragment is (one cut-region) ∩ (one depth band), so a single
+   region of the picture comes apart in depth order along the same direction.     */
+function splitPoly(P, nx, ny, c) {
+  const a = [], b = [];
+  for (let i = 0; i < P.length; i++) {
+    const p = P[i], q = P[(i + 1) % P.length];
+    const sp = p[0] * nx + p[1] * ny - c, sq = q[0] * nx + q[1] * ny - c;
+    (sp >= 0 ? a : b).push(p);
+    if ((sp >= 0) !== (sq >= 0)) {
+      const t = sp / (sp - sq), m = [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t];
+      a.push(m); b.push(m);
+    }
+  }
+  return [a, b];
+}
+
+function buildShards() {
+  const S = CFG.shards, rnd = mulberry32(S.seed);
+  const { w, h, band } = depth, B = CFG.bands;
+  let polys = [[[0, 0], [A.IW, 0], [A.IW, A.IH], [0, A.IH]]];
+  const cuts = [];
+  for (let i = 0; i < S.cuts; i++) {
+    const px = A.IW * (0.15 + 0.7 * rnd()), py = A.IH * (0.15 + 0.7 * rnd()), ang = rnd() * Math.PI;
+    const nx = Math.cos(ang), ny = Math.sin(ang), c = nx * px + ny * py;
+    cuts.push([nx, ny, c]);
+    const next = [];
+    for (const P of polys) { const [a, b] = splitPoly(P, nx, ny, c); if (a.length > 2) next.push(a); if (b.length > 2) next.push(b); }
+    polys = next;
+  }
+  const codeOf = (x, y) => { let k = 0; cuts.forEach(([nx, ny, c], i) => { if (x * nx + y * ny - c >= 0) k |= 1 << i; }); return k; };
+  const polyIndex = new Map();
+  polys.forEach((P, i) => {
+    const cx = P.reduce((s, p) => s + p[0], 0) / P.length, cy = P.reduce((s, p) => s + p[1], 0) / P.length;
+    polyIndex.set(codeOf(cx, cy), i);
+  });
+  // pixel statistics per (band, region) at depth resolution
+  const stats = new Map();
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const ax = (x + 0.5) / w * A.IW, ay = (y + 0.5) / h * A.IH;
+    const r = polyIndex.get(codeOf(ax, ay));
+    if (r === undefined) continue;
+    const key = band[y * w + x] * 1000 + r;
+    let s = stats.get(key);
+    if (!s) stats.set(key, s = { n: 0, sx: 0, sy: 0, x0: 1e9, y0: 1e9, x1: -1e9, y1: -1e9 });
+    s.n++; s.sx += ax; s.sy += ay;
+    s.x0 = Math.min(s.x0, ax); s.y0 = Math.min(s.y0, ay); s.x1 = Math.max(s.x1, ax); s.y1 = Math.max(s.y1, ay);
+  }
+  const regionRnd = polys.map(() => [rnd(), rnd()]);
+  const pad = Math.ceil(A.IW / w) + 2;
+  releaseShards();
+  shardsVersion = layersVersion;
+  for (const [key, s] of stats) {
+    if (s.n < 4) continue;
+    const k = Math.floor(key / 1000), r = key % 1000, P = polys[r];
+    const bx = Math.max(0, Math.floor(s.x0 - pad)), by = Math.max(0, Math.floor(s.y0 - pad));
+    const bw = Math.min(A.IW, Math.ceil(s.x1 + pad)) - bx, bh = Math.min(A.IH, Math.ceil(s.y1 + pad)) - by;
+    const c = document.createElement('canvas'); c.width = bw; c.height = bh;
+    const g = c.getContext('2d');
+    g.beginPath(); P.forEach((p, i) => i ? g.lineTo(p[0] - bx, p[1] - by) : g.moveTo(p[0] - bx, p[1] - by)); g.closePath();
+    g.clip();
+    g.drawImage(layers[k].canvas, -bx, -by);
+    // fly away from the image centre; nearer bands of the same region fly further
+    const cx = s.sx / s.n, cy = s.sy / s.n;
+    const rcx = P.reduce((a, p) => a + p[0], 0) / P.length, rcy = P.reduce((a, p) => a + p[1], 0) / P.length;
+    let dx = rcx - A.IW / 2, dy = rcy - A.IH / 2; const L = Math.hypot(dx, dy) || 1; dx /= L; dy /= L;
+    const [ra, rb] = regionRnd[r];
+    shards.push({ k, canvas: c, bx, by, cx, cy, dirX: dx, dirY: dy * 0.55,
+                  reach: S.reach * weightOf(k) * (0.6 + 0.8 * ra), spin: S.spin * (rb - 0.5) * weightOf(k) * 2 });
+  }
+  shards.sort((a, b) => b.k - a.k);       // far first, near on top
+}
+
+/* ---- traces: every few px of movement, a layer leaves something behind --------- */
+function stamp(ctx, L, a) {
+  const { x, y, s } = placeOf(L, a);
+  if (style === 'lines') {
+    ctx.lineWidth = 0.8;
+    ctx.strokeStyle = `rgba(28,28,30,${0.10 + 0.10 * nearness(L.k)})`;
+    strokeLines(ctx, L.lines, x, y, s);
+  } else if (style === 'extrude') {
+    ctx.drawImage(L.canvas, x, y, A.IW * s, A.IH * s);       // a solid slice …
+    ctx.lineWidth = 0.7;
+    ctx.strokeStyle = 'rgba(20,20,22,0.38)';                 // … with a dark rib at its edge
+    strokeLines(ctx, L.lines, x, y, s);
+  }
+}
+
+function recordTraces() {
+  if (style === 'shards') return;
+  const step = CFG[style].step;
+  tctx.lineCap = 'round'; tctx.lineJoin = 'round';
+  for (let k = layers.length - 1; k >= 0; k--) {       // far first so near trails sit on top
+    const L = layers[k];
+    if (L.lastA === null) { stamp(tctx, L, amount); L.lastA = amount; continue; }
+    const dist = Math.abs(amount - L.lastA) * travelOf(L);
+    const n = Math.min(240, Math.floor(dist / step));
+    if (n < 1) continue;
+    const a0 = L.lastA, a1 = L.lastA + (amount - L.lastA) * (n * step / dist);
+    for (let i = 1; i <= n; i++) stamp(tctx, L, a0 + (a1 - a0) * i / n);
+    L.lastA = a1;
+  }
+}
+
+/* ---- render -------------------------------------------------------------------- */
+const ease = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+let lastT = performance.now();
+
+function frame(now) {
+  try { renderFrame(now); } catch (e) { console.error(e); }   // one bad frame never stops the loop
+  requestAnimationFrame(frame);
+}
+function renderFrame(now) {
+  const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
+  if (stage === 'exploded') {
+    if (tween) {
+      const p = Math.min(1, (now - tween.t0) / CFG.explodeMs);
+      amount = ease(p) * target;
+      slider.value = Math.round(amount * 100); amountOut.textContent = slider.value;
+      if (p >= 1) { tween = null; setStatus('drag Explosion Amount · switch style · space replays · upload another image'); }
+    } else {
+      amount += (target - amount) * (1 - Math.exp(-dt / 0.18));
+      if (Math.abs(target - amount) < 1e-4) amount = target;
+    }
+    recordTraces();
+  }
+
+  actx.fillStyle = '#f6f5f1';
+  actx.fillRect(0, 0, A.W, A.H);
+  const o = origin(stage === 'exploded' ? style : 'lines');
+  if (stage === 'estimating') actx.drawImage(cap, o.x, o.y);
+  else if (stage === 'exploded') drawArtwork();
+  else {
+    actx.strokeStyle = dragging ? '#1c1c1e' : '#d5d1c9'; actx.lineWidth = 1;
+    actx.setLineDash([6, 6]); actx.strokeRect(o.x + 0.5, o.y + 0.5, A.IW, A.IH); actx.setLineDash([]);
+    actx.fillStyle = '#8e8b85'; actx.font = '22px ui-monospace, Menlo, monospace'; actx.textAlign = 'center';
+    actx.fillText('upload · drop · paste an image', o.x + A.IW / 2, o.y + A.IH / 2);
+    actx.textAlign = 'left';
+  }
+}
+
+function drawArtwork() {
+  actx.lineCap = 'round'; actx.lineJoin = 'round';
+  if (style === 'shards') return drawShards();
+  const o = origin();
+  actx.globalAlpha = op.trace;
+  actx.drawImage(traces, 0, 0);
+  actx.globalAlpha = (1 - CFG[style].fade * amount) * op.image;
+  for (let k = layers.length - 1; k >= 0; k--) {
+    const { x, y, s } = placeOf(layers[k]);
+    actx.drawImage(layers[k].canvas, x, y, A.IW * s, A.IH * s);
+  }
+  actx.globalAlpha = 1;
+  if (style === 'lines') {
+    for (const L of layers) {
+      const { x, y, s } = placeOf(L);
+      actx.lineWidth = 0.9;
+      actx.strokeStyle = `rgba(28,28,30,${(0.25 + 0.35 * amount) * op.trace})`;
+      strokeLines(actx, L.lines, x, y, s);
+    }
+  }
+  if (direction === 'forward') drawFrames(); else drawRuler(o);
+}
+
+/* diagram ruler: where each band currently sits */
+function drawRuler(o) {
+  const a = Math.min(1, amount * 3);
+  if (a < 0.01) return;
+  const y = o.y - 40;
+  actx.strokeStyle = `rgba(28,28,30,${0.35 * a})`;
+  actx.fillStyle = `rgba(28,28,30,${0.6 * a})`;
+  actx.lineWidth = 1;
+  actx.font = '13px ui-monospace, Menlo, monospace';
+  actx.textAlign = 'center';
+  actx.beginPath();
+  actx.moveTo(o.x, y + 0.5); actx.lineTo(o.x + A.IW + CFG.maxShift, y + 0.5);
+  for (const L of layers) {
+    const x = Math.round(o.x + offsetOf(L).dx) + 0.5;
+    actx.moveTo(x, y - 9); actx.lineTo(x, y + 9);
+  }
+  actx.stroke();
+  for (const L of layers) actx.fillText(String(L.k + 1), o.x + offsetOf(L).dx, y - 16);
+  actx.textAlign = 'left';
+}
+
+/* forward: each layer's picture plane marked by corner ticks + its band number */
+function drawFrames() {
+  const a = Math.min(1, amount * 3);
+  if (a < 0.01) return;
+  actx.strokeStyle = `rgba(28,28,30,${0.45 * a})`;
+  actx.fillStyle = `rgba(28,28,30,${0.65 * a})`;
+  actx.lineWidth = 1;
+  actx.font = '13px ui-monospace, Menlo, monospace';
+  const t = 14;
+  for (const L of layers) {
+    const { x, y, s } = placeOf(L), w = A.IW * s, h = A.IH * s;
+    actx.beginPath();
+    for (const [cx, cy, sx, sy] of [[x, y, 1, 1], [x + w, y, -1, 1], [x, y + h, 1, -1], [x + w, y + h, -1, -1]]) {
+      actx.moveTo(cx + sx * t, cy); actx.lineTo(cx, cy); actx.lineTo(cx, cy + sy * t);
+    }
+    actx.stroke();
+    if (x > 4 && y > 18) actx.fillText(String(L.k + 1), x + 3, y - 5);
+  }
+}
+
+/* fragments + exploded-diagram leader lines with pin dots */
+function drawShards() {
+  const o = origin();
+  const pos = shards.map(s => ({ x: o.x + s.cx + s.dirX * s.reach * amount, y: o.y + s.cy + s.dirY * s.reach * amount }));
+  // leader lines: from where each fragment was to where it is now
+  actx.lineWidth = 0.6;
+  actx.strokeStyle = `rgba(28,28,30,${0.28 * Math.min(1, amount * 2) * op.trace})`;
+  actx.beginPath();
+  shards.forEach((s, i) => {
+    if (s.reach * amount < 6) return;
+    actx.moveTo(o.x + s.cx, o.y + s.cy); actx.lineTo(pos[i].x, pos[i].y);
+  });
+  actx.stroke();
+  // fragments
+  actx.globalAlpha = op.image;
+  shards.forEach((s, i) => {
+    actx.save();
+    actx.translate(pos[i].x, pos[i].y);
+    actx.rotate(s.spin * amount);
+    if (direction === 'forward') { const z = 1 + amount * CFG.zoom * 0.6 * weightOf(s.k); actx.scale(z, z); }
+    actx.drawImage(s.canvas, s.bx - s.cx, s.by - s.cy);
+    actx.restore();
+  });
+  actx.globalAlpha = 1;
+  // pins
+  actx.fillStyle = `rgba(250,250,248,${0.9 * Math.min(1, amount * 2) * op.trace})`;
+  actx.strokeStyle = `rgba(28,28,30,${0.5 * Math.min(1, amount * 2) * op.trace})`;
+  actx.lineWidth = 0.8;
+  shards.forEach((s, i) => {
+    if (s.reach * amount < 6 || s.canvas.width * s.canvas.height < 900) return;
+    actx.beginPath(); actx.arc(pos[i].x, pos[i].y, 2.6, 0, Math.PI * 2); actx.fill(); actx.stroke();
+  });
+}
+
+/* ---- debug thumbnails (screen only) -------------------------------------------- */
+function drawDebug() {
+  if (!depth) return;
+  $('fMasks').querySelector('figcaption').textContent = `depth bands 1 (near) → ${CFG.bands} (far)`;
+  const { field, w, h, band } = depth;
+  for (const [id, fn] of [['tDepth', i => field[i] * 255], ['tMasks', i => 30 + (CFG.bands - 1 - band[i]) * (210 / (CFG.bands - 1))]]) {
+    const c = $(id); c.width = w; c.height = h;
+    const cx = c.getContext('2d'), img = cx.createImageData(w, h);
+    for (let i = 0; i < field.length; i++) {
+      const v = fn(i);
+      img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = v; img.data[i * 4 + 3] = 255;
+    }
+    cx.putImageData(img, 0, 0);
+  }
+}
+for (const [box, fig] of [['dbgDepth', 'fDepth'], ['dbgMasks', 'fMasks']])
+  $(box).addEventListener('change', () => $(fig).classList.toggle('on', $(box).checked));
+
+/* ---- interface ----------------------------------------------------------------- */
+function setStyle(s) {
+  style = s;
+  document.querySelectorAll('#styles button').forEach(b => b.classList.toggle('on', b.dataset.style === s));
+  if (stage === 'exploded') { if (target < 0.2) target = 1; replay(); }
+}
+function setDirection(d) {
+  direction = d;
+  document.querySelectorAll('#dirs button').forEach(b => b.classList.toggle('on', b.dataset.dir === d));
+  if (stage === 'exploded') { if (target < 0.2) target = 1; replay(); }
+  else layoutArt(style);
+}
+function clearAll() {
+  tctx.clearRect(0, 0, A.W, A.H);
+  releaseShards(); for (const c of layerPool) releaseCanvas(c); layerPool.length = 0;
+  layers = []; depth = null; tween = null; amount = 0;
+  slider.value = 100; target = 1; amountOut.textContent = '100';
+  slider.disabled = true; $('save').disabled = true;
+  hasImage = false; stage = 'idle'; $('clear').disabled = true;
+  A.IW = 1200; A.IH = 900; layoutArt('lines');
+  setStatus('upload an image, drop one here, or paste one');
+}
+function savePNG() {
+  if (stage !== 'exploded') return;
+  actx.fillStyle = '#f6f5f1'; actx.fillRect(0, 0, A.W, A.H);
+  drawArtwork();
+  art.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = `pseudo-depth-${direction}-${style}-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }, 'image/png');
+}
+
+slider.addEventListener('input', () => { tween = null; target = slider.value / 100; amountOut.textContent = slider.value; });
+for (const [id, key] of [['imgOp', 'image'], ['trOp', 'trace']])
+  $(id).addEventListener('input', () => { op[key] = $(id).value / 100; $(id + 'Out').textContent = $(id).value; });
+$('bands').addEventListener('input', () => { $('bandsOut').textContent = $('bands').value; });
+$('bands').addEventListener('change', () => {          // re-cut the same depth map into a new number of bands
+  const n = +$('bands').value;
+  if (stage !== 'exploded' || !depth) { CFG.bands = n; return; }
+  setStatus(`depth → ${n} bands → layers…`);
+  setTimeout(() => {
+    try {
+      CFG.bands = n;                                     // changes together with the layers it describes
+      buildLayers(); drawDebug();
+      if (target < 0.2) target = 1;
+      replay();
+    } catch (e) {
+      console.error(e);
+      setStatus('could not re-cut the layers: ' + (e?.message || e));
+    }
+  }, 0);
+});
+document.querySelectorAll('#styles button').forEach(b => b.addEventListener('click', () => setStyle(b.dataset.style)));
+document.querySelectorAll('#dirs button').forEach(b => b.addEventListener('click', () => setDirection(b.dataset.dir)));
+$('upload').addEventListener('click', () => $('file').click());
+$('file').addEventListener('change', e => { loadImageFile(e.target.files[0]); e.target.value = ''; });
+$('src').addEventListener('change', () => { if (hasImage) process(); });
+let dragging = false;
+window.addEventListener('dragover', e => { e.preventDefault(); dragging = true; });
+window.addEventListener('dragleave', () => { dragging = false; });
+window.addEventListener('drop', e => { e.preventDefault(); dragging = false; loadImageFile(e.dataTransfer.files[0]); });
+window.addEventListener('paste', e => {
+  const item = [...(e.clipboardData?.items || [])].find(i => i.type.startsWith('image/'));
+  if (item) loadImageFile(item.getAsFile());
+});
+$('clear').addEventListener('click', clearAll);
+$('save').addEventListener('click', savePNG);
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' && stage === 'exploded') { e.preventDefault(); replay(); }
+  const i = ['Digit1', 'Digit2', 'Digit3'].indexOf(e.code);
+  if (i >= 0) setStyle(['lines', 'extrude', 'shards'][i]);
+});
+
+layoutArt('lines');
+ensureModel().catch(e => { console.error(e); if (stage === 'idle') setStatus('depth model could not load — choose depth: brightness'); });
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
